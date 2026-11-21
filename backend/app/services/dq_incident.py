@@ -96,23 +96,27 @@ class DqIncidentService(BaseModuleService):
         }
         rows.append(entry)
 
-        # 关联写入趋势记录
+        # 关联写入趋势记录：按业务日期归组，同一日期不会重复成桶。
+        from app.services import time_series
+
         trend_rows = store.rows("dq_trend")
-        new_tid = max((int(r.get("id", 0)) for r in trend_rows), default=0) + 1
-        trend_rows.append({
-            "id": new_tid,
-            "记录编号": f"DQ_T-{new_tid:04d}",
-            "目标表名": table_name,
-            "日期": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        day = datetime.now(timezone.utc).date()
+        payload = {
             "完备率": f"{random.uniform(70, 85):.1f}%",
             "准确率": f"{random.uniform(75, 90):.1f}%",
             "及时率": f"{random.uniform(80, 95):.1f}%",
             "综合质量": f"{random.uniform(70, 85):.1f}",
             "趋势标记": "下降趋势",
+            "来源分区": f"dt={day.strftime(time_series.DATE_FORMAT)}",
+            "分组日期": day.strftime(time_series.DATE_FORMAT),
+            "记录类型": "日汇总",
             "status": "下降趋势",
             "pending": True,
             "abnormal": True,
-        })
+        }
+        entry_trend = time_series.upsert_daily_bucket(trend_rows, table_name, day, payload)
+        if not entry_trend.get("记录编号"):
+            entry_trend["记录编号"] = f"DQ_T-{int(entry_trend.get('id', 0)):04d}"
 
         return entry
 
@@ -126,7 +130,16 @@ class DqIncidentService(BaseModuleService):
         related = [i for i in all_incidents if table_name in str(i.get("关联规则", ""))]
 
         if not related:
-            return {"目标表名": table_name, "状态": "无历史事件", "趋势": "平稳"}
+            return {
+                "目标表名": table_name,
+                "状态": "无历史事件",
+                "历史事件总数": 0,
+                "已修复": 0,
+                "修复率": "N/A",
+                "趋势方向": "平稳",
+                "趋势": "平稳",
+                "建议": "保持监控",
+            }
 
         resolved = sum(1 for i in related if i.get("status") in ("已修复", "已关闭"))
         resolution_rate = resolved / len(related) * 100 if related else 0

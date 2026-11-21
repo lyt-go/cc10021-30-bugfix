@@ -9,11 +9,11 @@ domain_chain: 指标波动检测 (metric_monitor)
 from __future__ import annotations
 
 import random
-import math
 from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services import time_series
 from app.store import store
 
 
@@ -113,44 +113,158 @@ class MetricMonitorService(BaseModuleService):
             "abnormal": level == "critical",
         })
 
-    def aggregate_metric_trends(self, table_name: str, days: int = 7) -> list[dict[str, Any]]:
-        """聚合多日指标查询结果，生成趋势分析数据。
+    def aggregate_metric_trends(
+        self,
+        table_name: str,
+        days: int = 7,
+        *,
+        metric_field: str = "",
+        end_date: Any = None,
+        partitions: Any = None,
+    ) -> list[dict[str, Any]]:
+        """聚合多日指标查询结果，生成按业务日期归组的日汇总序列。
 
-        查询连续N天的监控指标，聚合波动趋势并关联到趋势看板。
+        日期桶端点由分区日期决定（没有分区日期时才用采集完成时间兜底），
+        因此月底分区即使次月在采集，也仍归属月底那天，不会串到月初。
+        同一分区的并发更正按 ``(目标表名, 日期)`` 去重，只保留一条日汇总；
+        已签收的历史日期不会被后续批次覆盖。输出日期一律为 ``YYYY-MM-DD``。
         """
-        trends = []
-        base_value = random.uniform(1000, 50000)
-        for day_offset in range(days, 0, -1):
-            daily_value = base_value * random.uniform(0.7, 1.3)
-            volatility = abs(daily_value - base_value) / base_value * 100
+        days = max(int(days), 1)
+        anchor = time_series.parse_day(end_date)
+        if anchor is None:
+            anchor = max(
+                (
+                    time_series.partition_day(item)
+                    for item in time_series.normalize_partition_input(partitions)
+                    if time_series.row_table(item) in ("", table_name)
+                ),
+                default=None,
+            )
+        if anchor is None:
+            anchor = datetime.now(timezone.utc).date()
+
+        window = time_series.date_window(anchor, days)
+        supplied = time_series.normalize_partition_input(partitions)
+        buckets, superseded = time_series.dedupe_daily_records(
+            supplied,
+            table_name=table_name,
+            start=window[0] if window else None,
+            end=window[-1] if window else None,
+        )
+
+        # 已签收的历史日汇总优先保留（即便不在本次分区入参里）。
+        existing = time_series.dedupe_daily_records(
+            [
+                dict(row, **{"目标表名": table_name})
+                for row in store.rows("dq_trend")
+                if row.get("目标表名") == table_name
+                and time_series.is_signed(row)
+            ],
+            table_name=table_name,
+            start=window[0] if window else None,
+            end=window[-1] if window else None,
+        )[0]
+        bucket_days = {time_series.parse_day(bucket["日期"]) for bucket in buckets}
+        for bucket in existing:
+            bucket_day = time_series.parse_day(bucket["日期"])
+            if bucket_day is not None and bucket_day not in bucket_days:
+                buckets.append(bucket)
+                bucket_days.add(bucket_day)
+        buckets.sort(key=lambda item: item["日期"])
+
+        # 只记录本次实际有分区的日期；空档日期用清晰的“未出数”标记占位。
+        trends: list[dict[str, Any]] = []
+        for day in window:
+            bucket = next(
+                (item for item in buckets if time_series.parse_day(item["日期"]) == day), None)
+            if bucket is None:
+                trends.append({
+                    "日期": day.strftime(time_series.DATE_FORMAT),
+                    "表名": table_name,
+                    "指标字段": metric_field,
+                    "指标值": None,
+                    "波动率": None,
+                    "趋势": "未出数",
+                    "来源分区": "",
+                    "采集时间": "",
+                    "分组日期": day.strftime(time_series.DATE_FORMAT),
+                    "已签收": False,
+                    "状态": "未出数",
+                })
+                continue
+            value = bucket.get("指标值")
+            baseline = bucket.get("基线值")
+            if value is None:
+                volatility = bucket.get("波动率")
+                direction = "未出数"
+            else:
+                volatility = (
+                    round(abs(value - baseline) / baseline * 100, 2)
+                    if baseline not in (None, 0) else bucket.get("波动率")
+                )
+                direction = "上升" if baseline is None or value >= baseline else "下降"
             trends.append({
-                "日期": f"2026-11-{18 - day_offset:02d}",
+                "日期": bucket["日期"],
                 "表名": table_name,
-                "指标值": round(daily_value, 2),
-                "波动率": f"{volatility:.2f}%",
-                "趋势": "上升" if daily_value > base_value else "下降",
+                "指标字段": metric_field,
+                "指标值": round(value, 2) if isinstance(value, (int, float)) else value,
+                "波动率": f"{volatility:.2f}%" if isinstance(volatility, (int, float)) else None,
+                "趋势": direction,
+                "来源分区": bucket["来源分区"],
+                "采集时间": bucket["采集时间"],
+                "采集批号": bucket["采集批号"],
+                "分组日期": bucket["分组日期"] or bucket["日期"],
+                "已签收": bucket["已签收"],
+                "去重批次数": bucket["去重批次数"],
+                "状态": "已签收" if bucket["已签收"] else "正常",
             })
 
-        # 聚合趋势写入趋势记录
+        self._persist_metric_buckets(table_name, metric_field, buckets)
+        return trends
+
+    def _persist_metric_buckets(
+        self, table_name: str, metric_field: str, buckets: list[dict[str, Any]]
+    ) -> None:
+        """把日汇总写回趋势看板，监控入口与趋势详情共用同一批日期数据。"""
         trend_rows = store.rows("dq_trend")
-        for t in trends:
-            new_tid = max((int(r.get("id", 0)) for r in trend_rows), default=0) + 1
-            trend_rows.append({
-                "id": new_tid,
-                "记录编号": f"DQ_T-{new_tid:04d}",
+        for bucket in buckets:
+            day = time_series.parse_day(bucket["日期"])
+            if day is None:
+                continue
+            # 监控指标没有维度的日汇总用指标本身补齐趋势字段，保证趋势详情能直接用。
+            metric_value = bucket.get("指标值")
+            baseline = bucket.get("基线值")
+            quality = bucket.get("综合质量")
+            if quality is None and metric_value is not None and baseline not in (None, 0):
+                quality = round(100 - abs(metric_value - baseline) / baseline * 100, 2)
+            payload = {
+                "记录编号": bucket.get("记录编号", ""),
                 "目标表名": table_name,
-                "日期": t["日期"],
-                "完备率": f"{random.uniform(85, 100):.1f}%",
-                "准确率": f"{random.uniform(80, 99):.1f}%",
-                "及时率": f"{random.uniform(90, 100):.1f}%",
-                "综合质量": f"{random.uniform(85, 98):.1f}",
-                "趋势标记": t["趋势"],
+                "指标字段": metric_field,
+                "完备率": f"{bucket['完备率']:.1f}%" if bucket.get("完备率") is not None else "",
+                "准确率": f"{bucket['准确率']:.1f}%" if bucket.get("准确率") is not None else "",
+                "及时率": f"{bucket['及时率']:.1f}%" if bucket.get("及时率") is not None else "",
+                "综合质量": f"{quality:.1f}" if quality is not None else "",
+                "指标值": metric_value,
+                "基线值": baseline,
+                "波动率": bucket.get("波动率"),
+                "趋势标记": bucket.get("趋势", "正常"),
+                "来源分区": bucket.get("来源分区", ""),
+                "采集时间": bucket.get("采集时间", ""),
+                "采集批号": bucket.get("采集批号", ""),
+                "分组日期": bucket.get("分组日期") or bucket.get("日期"),
+                "批次数": bucket.get("批次数", 1),
+                "去重批次数": bucket.get("去重批次数", 0),
+                "已签收": bucket.get("已签收", False),
+                "后续修订": bucket.get("后续修订", []),
+                "记录类型": "日汇总",
                 "status": "正常",
                 "pending": False,
                 "abnormal": False,
-            })
-
-        return trends
+            }
+            entry = time_series.upsert_daily_bucket(trend_rows, table_name, day, payload)
+            if not entry.get("记录编号"):
+                entry["记录编号"] = f"DQ_T-{int(entry.get('id', 0)):04d}"
 
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()

@@ -7,7 +7,6 @@ domain_chain: 质量报告 (dq_report)
 
 from __future__ import annotations
 
-import random
 from datetime import datetime, timezone
 from typing import Any
 
@@ -47,15 +46,20 @@ class DqReportService(BaseModuleService):
         open_incidents = sum(1 for r in incident_rows if r.get("status") in ("待确认", "调查中"))
         resolved_incidents = sum(1 for r in incident_rows if r.get("status") in ("已修复", "已关闭"))
 
-        # 计算质量趋势
-        quality_trends = [t for t in trend_rows]
+        # 计算质量趋势：只采纳日期有效、综合质量可解析的日汇总，
+        # 避免历史拼接出来的 00 日 / 负数日继续污染报表结论。
+        from app.services import time_series
+
+        quality_trends = [
+            t for t in trend_rows
+            if time_series.parse_day(t.get("日期")) is not None
+            and time_series.to_number(t.get("综合质量")) is not None
+            and t.get("记录类型", "日汇总") == "日汇总"
+        ]
         avg_quality = 0
         quality_values = []
         for t in quality_trends:
-            try:
-                quality_values.append(float(t.get("综合质量", "0")))
-            except (ValueError, TypeError):
-                pass
+            quality_values.append(time_series.to_number(t.get("综合质量")))
         if quality_values:
             avg_quality = sum(quality_values) / len(quality_values)
 

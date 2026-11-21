@@ -62,6 +62,7 @@ class DqScorecardService(BaseModuleService):
         # 写入评分卡记录
         rows = store.rows(self.MODULE)
         new_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
+        scored_at = datetime.now(timezone.utc)
         entry = {
             "id": new_id,
             "记录编号": f"DQ_S-{new_id:04d}",
@@ -70,7 +71,7 @@ class DqScorecardService(BaseModuleService):
             "准确性得分": str(round(accuracy, 1)),
             "时效性得分": str(round(timeliness, 1)),
             "综合得分": str(round(overall, 1)),
-            "评分时间": datetime.now(timezone.utc).isoformat(),
+            "评分时间": scored_at.strftime("%Y-%m-%d"),
             "评分版本": "v1.0",
             "status": "已完成",
             "pending": False,
@@ -79,7 +80,7 @@ class DqScorecardService(BaseModuleService):
         rows.append(entry)
 
         # 聚合评分结果写入趋势记录
-        self._write_trend_record(table_name, completeness, accuracy, timeliness, overall)
+        self._write_trend_record(table_name, completeness, accuracy, timeliness, overall, scored_at)
 
         return {
             "目标表名": table_name,
@@ -95,24 +96,28 @@ class DqScorecardService(BaseModuleService):
         }
 
     def _write_trend_record(self, table_name: str, completeness: float, accuracy: float,
-                            timeliness: float, overall: float) -> None:
-        """聚合评分数据写入质量趋势记录。"""
+                            timeliness: float, overall: float, scored_at: Any = None) -> None:
+        """聚合评分数据写入质量趋势记录；日期按评分业务日期归组，重复评分只算一次。"""
+        from app.services import time_series
+
         trend_rows = store.rows("dq_trend")
-        new_tid = max((int(r.get("id", 0)) for r in trend_rows), default=0) + 1
-        trend_rows.append({
-            "id": new_tid,
-            "记录编号": f"DQ_T-{new_tid:04d}",
-            "目标表名": table_name,
-            "日期": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        day = time_series.parse_day(scored_at) or datetime.now(timezone.utc).date()
+        payload = {
             "完备率": f"{completeness:.1f}%",
             "准确率": f"{accuracy:.1f}%",
             "及时率": f"{timeliness:.1f}%",
             "综合质量": f"{overall:.1f}",
             "趋势标记": "正常" if overall >= 75 else "下降趋势",
+            "来源分区": f"dt={day.strftime(time_series.DATE_FORMAT)}",
+            "分组日期": day.strftime(time_series.DATE_FORMAT),
+            "记录类型": "日汇总",
             "status": "正常" if overall >= 75 else "下降趋势",
             "pending": False,
             "abnormal": overall < 60,
-        })
+        }
+        entry = time_series.upsert_daily_bucket(trend_rows, table_name, day, payload)
+        if not entry.get("记录编号"):
+            entry["记录编号"] = f"DQ_T-{int(entry.get('id', 0)):04d}"
 
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()

@@ -200,6 +200,17 @@ export const MODULES: ModuleMeta[] = [
     actionTargets: {"标记下降": "下降趋势", "标记需关注": "需关注", "标记已改善": "已改善"},
     metrics: ["趋势记录总数", "下降趋势记录", "需关注记录"],
   },
+  {
+    key: "dq_trend_review",
+    name: "质量趋势复核清单",
+    entity: "复核记录",
+    desc: "沉淀质量趋势计算的复核结论，预留本次日汇总序列、来源分区和分组日期，供报表核对。",
+    fields: ["复核编号", "目标表名", "复核日期", "窗口起始", "窗口结束", "趋势方向", "变化率", "结论"],
+    statuses: ["已复核", "待复核", "已归档"],
+    actions: ["标记待复核", "确认复核", "归档复核"],
+    actionTargets: {"标记待复核": "待复核", "确认复核": "已复核", "归档复核": "已归档"},
+    metrics: ["复核记录总数", "待复核记录", "已复核记录"],
+  },
 ]
 
 export const MODULE_BY_KEY: Map<string, ModuleMeta> = new Map(
